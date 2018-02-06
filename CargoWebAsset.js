@@ -4,16 +4,11 @@ const fs = require( "parcel-bundler/src/utils/fs" );
 const pipeSpawn = require( "parcel-bundler/src/utils/pipeSpawn" );
 
 const command_exists = require( "command-exists" );
-const child_process = require( "child_process" );
+const {spawn, exec, execFile} = require( "child-process-promise" );
 const Asset = require( "parcel-bundler/src/Asset" );
 const path = require( "path" );
 
-const promisify = require( "parcel-bundler/src/utils/promisify" );
-const exec = promisify( child_process.execFile );
-
 const REQUIRED_CARGO_WEB = [0, 6, 2];
-
-let cargo_web_command = null;
 
 class CargoWebAsset extends Asset {
     constructor( name, pkg, options ) {
@@ -33,7 +28,7 @@ class CargoWebAsset extends Asset {
         return super.process();
     }
 
-    async check_for_rustup() {
+    static async check_for_rustup() {
         try {
             await command_exists( "rustup" );
         } catch( err ) {
@@ -43,64 +38,42 @@ class CargoWebAsset extends Asset {
         }
     }
 
-    async install_nightly() {
-        let [stdout] = await exec( "rustup", ["show"] );
-        if( !stdout.includes( "nightly" ) ) {
+    static async install_nightly() {
+        const rustup_show = await exec( "rustup show" );
+        if( !rustup_show.stdout.includes( "nightly" ) ) {
             await pipeSpawn( "rustup", ["update"] );
             await pipeSpawn( "rustup", ["toolchain", "install", "nightly"] );
         }
     }
 
-    async install_cargo_web() {
-        if( cargo_web_command ) {
-            return;
+    static async install_cargo_web() {
+        let install_required;
+        try {
+            const cargo_web_version = await execFile( "cargo-web", [ "--version" ]);
+            install_required = /(\d+)\.(\d+)\.(\d+)/
+                .exec( cargo_web_version.stdout )
+                .slice(1)
+                .map(match => parseInt(match, 10))
+                .some((version_fragment, i) => version_fragment < REQUIRED_CARGO_WEB[i]);
+        } catch(_) {
+            install_required = true;
         }
 
-        if( process.env.CARGO_WEB ) {
-            cargo_web_command = process.env.CARGO_WEB;
-            return;
-        }
-
-        const version = await new Promise( (resolve) => {
-            child_process.execFile( "cargo-web", [ "--version" ], (err, stdout) => {
-                if( err ) {
-                    resolve( [0, 0, 0] );
-                } else {
-                    const matches = /(\d+)\.(\d+)\.(\d+)/.exec( stdout );
-                    resolve( [parseInt( matches[1], 10 ), parseInt( matches[2], 10 ), parseInt( matches[3], 10 )] );
-                }
-            })
-        });
-
-        let is_up_to_date = true;
-        for( let i = 0; i < REQUIRED_CARGO_WEB.length; ++i ) {
-            if( version[i] > REQUIRED_CARGO_WEB[i] ) {
-                break;
-            } else if( version[i] === REQUIRED_CARGO_WEB[i] ) {
-                continue;
-            } else {
-                is_up_to_date = false;
-                break;
-            }
-        }
-
-        if( !is_up_to_date ) {
+        if ( install_required ) {
             await pipeSpawn( "cargo", [ "install", "-f", "cargo-web" ] );
         }
-
-        cargo_web_command = "cargo-web";
     }
 
     async parse() {
-        await this.check_for_rustup();
-        await this.install_nightly();
-        await this.install_cargo_web();
+        await CargoWebAsset.check_for_rustup();
+        await CargoWebAsset.install_nightly();
+        await CargoWebAsset.install_cargo_web();
 
         const dir = path.dirname( await config.resolve( this.name, ["Cargo.toml"] ) );
         const args = [
             "run",
             "nightly",
-            cargo_web_command,
+            "cargo-web",
             "build",
             "--target",
             "wasm32-unknown-unknown",
@@ -115,15 +88,16 @@ class CargoWebAsset extends Asset {
             stdio: ["ignore", "pipe", "pipe"]
         };
 
+        const rust_build = spawn( "rustup", args, opts );
+        const child = rust_build.childProcess;
+
         let artifact_wasm = null;
         let artifact_js = null;
         let output = "";
-
-        const child = child_process.spawn( "rustup", args, opts );
         let stdout = "";
         let stderr = "";
 
-        child.stdout.on( "data", (data) => {
+        child.stdout.on( "data", data => {
             stdout += data;
             for( ;; ) {
                 const index = stdout.indexOf( "\n" );
@@ -136,24 +110,14 @@ class CargoWebAsset extends Asset {
                 const msg = JSON.parse( raw_msg );
 
                 if( msg.reason === "compiler-artifact" ) {
-                    msg.filenames.forEach( filename => {
-                        if( filename.match( /\.js$/ ) ) {
-                            artifact_js = filename;
-                        } else if( filename.match( /\.wasm$/ ) ) {
-                            artifact_wasm = filename;
-                        }
-                    });
+                    artifact_js = msg.filenames.find(filename => filename.match( /\.js$/ ));
+                    artifact_wasm = msg.filenames.find(filename => filename.match( /\.wasm$/ ));
                 } else if( msg.reason === "message" ) {
                     output += msg.message.rendered;
                 } else if( msg.reason === "cargo-web-paths-to-watch" ) {
-                    const paths = msg.paths.map( (entry) => entry.path );
-                    paths.forEach( (path) => {
-                        if( path === this.name ) {
-                            return;
-                        }
-
-                        this.addDependency( path, { includedInParent: true } );
-                    });
+                    msg.paths
+                        .filter( entry => entry.path !== this.name )
+                        .forEach( entry => this.addDependency( entry.path, { includedInParent: true } ) );
                 }
             }
         });
@@ -172,54 +136,50 @@ class CargoWebAsset extends Asset {
             }
         });
 
-        const status = await new Promise( (resolve) => {
-            child.on( "close", (code) => {
-                resolve( code );
-            });
-        });
+        try {
+            await rust_build;
 
-        if( status !== 0 ) {
-            this.cargo_web_output = "Compilation failed!\n" + output;
-            throw new Error( `Compilation failed!` );
+            if( artifact_js === null ) {
+                throw new Error( "No .js artifact found! Are you sure your crate is of proper type?" );
+            }
+
+            if( artifact_wasm === null ) {
+                throw new Error( "No .wasm artifact found! This should never happen!" );
+            }
+
+            const loader_body = await fs.readFile( artifact_js );
+            const loader_path = path.join( this.scratch_dir, "loader-" + md5( this.name ) + ".js" );
+            const loader = `
+                module.exports = function( bundle ) {
+                    ${loader_body}
+                    return fetch( bundle )
+                        .then( response => response.arrayBuffer() )
+                        .then( bytes => WebAssembly.compile( bytes ) )
+                        .then( mod => __initialize( mod, true ) );
+                };
+            `;
+
+            // HACK: If we don't do this we're going to get
+            // "loadedAssets is not iterable" exception from Parcel
+            // on the first rebuild.
+            //
+            // It looks like Parcel really doesn't like it when
+            // the files it watches are being modified while it's running.
+            const loader_exists = await fs.exists( loader_path );
+            if( loader_exists ) {
+                setTimeout( () => {
+                    fs.writeFile( loader_path, loader );
+                }, 10 );
+            } else {
+                await fs.writeFile( loader_path, loader );
+            }
+
+            this.addDependency( loader_path );
+            this.artifact_wasm = artifact_wasm;
+        } catch(e) {
+            this.cargo_web_output = `Compilation failed!\n${output}`;
+            throw new Error( `Compilation failed: ${e.message}` );
         }
-
-        if( artifact_js === null ) {
-            throw new Error( "No .js artifact found! Are you sure your crate is of proper type?" );
-        }
-
-        if( artifact_wasm === null ) {
-            throw new Error( "No .wasm artifact found! This should never happen!" );
-        }
-
-        const loader_body = await fs.readFile( artifact_js );
-        const loader_path = path.join( this.scratch_dir, "loader-" + md5( this.name ) + ".js" );
-        const loader = `
-            module.exports = function( bundle ) {
-                ${loader_body}
-                return fetch( bundle )
-                    .then( response => response.arrayBuffer() )
-                    .then( bytes => WebAssembly.compile( bytes ) )
-                    .then( mod => __initialize( mod, true ) );
-            };
-        `;
-
-        // HACK: If we don't do this we're going to get
-        // "loadedAssets is not iterable" exception from Parcel
-        // on the first rebuild.
-        //
-        // It looks like Parcel really doesn't like it when
-        // the files it watches are being modified while it's running.
-        const loader_exists = await fs.exists( loader_path );
-        if( loader_exists ) {
-            setTimeout( () => {
-                fs.writeFile( loader_path, loader );
-            }, 10 );
-        } else {
-            await fs.writeFile( loader_path, loader );
-        }
-
-        this.addDependency( loader_path );
-        this.artifact_wasm = artifact_wasm;
     }
 
     collectDependencies() {}
