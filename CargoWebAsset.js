@@ -20,6 +20,10 @@ class CargoWebAsset extends Asset {
         this.scratch_dir = path.join( options.cacheDir, ".cargo-web" );
     }
 
+    cargo_web_command() {
+        return process.env.CARGO_WEB || "cargo-web";
+    }
+
     process() {
         if( this.options.isWarmUp ) {
             return;
@@ -46,10 +50,10 @@ class CargoWebAsset extends Asset {
         }
     }
 
-    static async install_cargo_web() {
+    async install_cargo_web() {
         let install_required;
         try {
-            const cargo_web_version = await execFile( "cargo-web", [ "--version" ]);
+            const cargo_web_version = await execFile( this.cargo_web_command(), [ "--version" ]);
             install_required = /(\d+)\.(\d+)\.(\d+)/
                 .exec( cargo_web_version.stdout )
                 .slice(1)
@@ -67,13 +71,13 @@ class CargoWebAsset extends Asset {
     async parse() {
         await CargoWebAsset.check_for_rustup();
         await CargoWebAsset.install_nightly();
-        await CargoWebAsset.install_cargo_web();
+        await this.install_cargo_web();
 
         const dir = path.dirname( await config.resolve( this.name, ["Cargo.toml"] ) );
         const args = [
             "run",
             "nightly",
-            "cargo-web",
+            this.cargo_web_command(),
             "build",
             "--target",
             "wasm32-unknown-unknown",
