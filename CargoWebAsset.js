@@ -32,15 +32,13 @@ class CargoWebAsset extends Asset {
         return super.process();
     }
 
-    static async check_for_rustup() {
-        try {
-            await command_exists( "rustup" );
-        } catch( err ) {
-            throw new Error(
-                "Rustup isn't installed. Visit https://rustup.rs/ for more info."
-            );
-        }
-    }
+    static rustup_is_installed() {
+        return new Promise(resolve => {
+            command_exists( "rustup" )
+                .then(cmd => resolve(cmd === "rustup"))
+                .catch(() => resolve(false));
+        })
+    };
 
     static async install_nightly() {
         const rustup_show = await exec( "rustup show" );
@@ -69,7 +67,10 @@ class CargoWebAsset extends Asset {
     }
 
     async parse() {
-        await CargoWebAsset.check_for_rustup();
+        if ( !await CargoWebAsset.rustup_is_installed() ) {
+            throw new Error("Rustup isn't installed. Visit https://rustup.rs/ for more info.");
+        }
+
         await CargoWebAsset.install_nightly();
         await this.install_cargo_web();
 
