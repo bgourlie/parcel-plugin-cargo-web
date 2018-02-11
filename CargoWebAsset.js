@@ -20,8 +20,39 @@ class CargoWebAsset extends Asset {
         this.scratch_dir = path.join( options.cacheDir, ".cargo-web" );
     }
 
-    cargo_web_command() {
-        return process.env.CARGO_WEB || "cargo-web";
+    static async cargo_web_command() {
+        let command = "cargo-web";
+        let isFromEnv = false;
+        let isInstalled, needsUpgrade;
+
+        if (process.env.CARGO_WEB) {
+            command = process.env.CARGO_WEB;
+            isFromEnv = true;
+        }
+
+        try {
+            await command_exists(command);
+            const cargo_web_version_output = (await execFile( command, [ "--version" ])).std;
+            if (cargo_web_version_output.startsWith("cargo-web ")) {
+                isInstalled = true;
+                needsUpgrade =
+                    !CargoWebAsset.cargo_web_version_is_satisfied(cargo_web_version_output, REQUIRED_CARGO_WEB);
+            } else {
+                isInstalled = false;
+            }
+        } catch(_) {
+            isInstalled = false;
+        }
+
+        return { command: command, isFromEnv: isFromEnv, isInstalled: isInstalled, needsUpgrade: needsUpgrade };
+    }
+
+    static cargo_web_version_is_satisfied(cargo_version_output, required_version) {
+        return !/(\d+)\.(\d+)\.(\d+)/
+            .exec( cargo_version_output )
+            .slice(1)
+            .map(match => parseInt(match, 10))
+            .some((version_fragment, i) => version_fragment < required_version[i]);
     }
 
     process() {
@@ -35,7 +66,7 @@ class CargoWebAsset extends Asset {
     static rustup_is_installed() {
         return new Promise(resolve => {
             command_exists( "rustup" )
-                .then(cmd => resolve(cmd === "rustup"))
+                .then(() => resolve(true))
                 .catch(() => resolve(false));
         })
     };
@@ -48,37 +79,30 @@ class CargoWebAsset extends Asset {
         }
     }
 
-    async install_cargo_web() {
-        let install_required;
-        try {
-            const cargo_web_version = await execFile( this.cargo_web_command(), [ "--version" ]);
-            install_required = /(\d+)\.(\d+)\.(\d+)/
-                .exec( cargo_web_version.stdout )
-                .slice(1)
-                .map(match => parseInt(match, 10))
-                .some((version_fragment, i) => version_fragment < REQUIRED_CARGO_WEB[i]);
-        } catch(_) {
-            install_required = true;
-        }
-
-        if ( install_required ) {
-            await pipeSpawn( "cargo", [ "install", "-f", "cargo-web" ] );
-        }
-    }
-
     async parse() {
         if ( !await CargoWebAsset.rustup_is_installed() ) {
             throw new Error("Rustup isn't installed. Visit https://rustup.rs/ for more info.");
         }
 
         await CargoWebAsset.install_nightly();
-        await this.install_cargo_web();
+
+        const cargo_web = await CargoWebAsset.cargo_web_command();
+
+        if(cargo_web.isFromEnv) {
+            if(!cargo_web.isInstalled) {
+                throw new Error("The custom cargo-web location defined in CARGO_WEB isn't valid.")
+            } else if(cargo_web.needsUpgrade) {
+                throw new Error("The custom cargo-web executable defined in CARGO_WEB needs to be manually upgraded");
+            }
+        } else if(!cargo_web.isInstalled || cargo_web.needsUpgrade) {
+            await pipeSpawn( "cargo", [ "install", "-f", "cargo-web" ] );
+        }
 
         const dir = path.dirname( await config.resolve( this.name, ["Cargo.toml"] ) );
         const args = [
             "run",
             "nightly",
-            this.cargo_web_command(),
+            cargo_web.command,
             "build",
             "--target",
             "wasm32-unknown-unknown",

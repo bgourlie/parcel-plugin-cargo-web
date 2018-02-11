@@ -3,10 +3,12 @@
   "version": "0.0.0",
   "description": "",
   "dependencies": {
-    "parcel-bundler": "^1.5.1",
-    "parcel-plugin-cargo-web": "file:.."
+    "parcel-bundler": "^1.5.1"
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "devDependencies": {
+    "parcel-plugin-cargo-web": "file:.."
   }
 }
