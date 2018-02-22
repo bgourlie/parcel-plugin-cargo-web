@@ -7,5 +7,5 @@ npm install
 npm run test
 
 rm -Rf .cache dist
-npm run example
+npm run build-example
 
